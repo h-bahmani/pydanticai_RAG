@@ -1,0 +1,401 @@
+
+import os
+import sys
+import asyncio
+import random
+import json
+from dataclasses import dataclass
+from typing import List, Optional, Set
+from typing_extensions import AsyncGenerator
+
+import httpx
+from dotenv import load_dotenv, find_dotenv
+from supabase import create_client, Client
+from pydantic import BaseModel, Field, ValidationError, TypeAdapter
+
+# Pydantic-AI + Gemini
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.providers.google import GoogleProvider
+
+
+# ----------------------------------------
+# 1) Pydantic Models and Settings
+# ----------------------------------------
+load_dotenv(find_dotenv(), override=True)
+
+
+class Settings(BaseModel):
+    """Required chat settings."""
+    SUPABASE_URL: str
+    SUPABASE_SERVICE_KEY: str
+    CLOUDFLARE_API_TOKEN: str
+    CLOUDFLARE_ACCOUNT_ID: str
+    GEMINI_API_KEY: str = Field(alias="GEMINI_API_KEY")
+
+    CLOUDFLARE_EMBED_MODEL: str = "@cf/baai/bge-m3"
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    FALLBACK_EMBED_DIM: int = 1024
+
+    TOP_K_RETRIEVAL: int = 6
+    SIMILARITY_THRESHOLD: float = 0.4 
+    TABLE_NAME: str = "site_pages"
+
+
+class RetrievedChunk(BaseModel):
+    """A retrieved chunk from Supabase."""
+    id: int
+    url: str
+    title: str
+    content: str
+    similarity: float
+    chunk_number: int
+
+# Model for Query Rewriting output
+class RewrittenQueries(BaseModel):
+    """Model for receiving optimized queries from Gemini."""
+    search_queries: List[str] = Field(
+        ..., 
+        max_length=3, 
+        description="A list of 1 to 3 optimized Farsi search queries, suitable for vector search based on the user's vague prompt. Used to convert the user's initial question into an effective search query."
+    )
+
+try:
+    config = Settings(
+        SUPABASE_URL=os.getenv("SUPABASE_URL"),
+        SUPABASE_SERVICE_KEY=os.getenv("SUPABASE_SERVICE_KEY"),
+        CLOUDFLARE_API_TOKEN=os.getenv("CLOUDFLARE_API_TOKEN"),
+        CLOUDFLARE_ACCOUNT_ID=os.getenv("CLOUDFLARE_ACCOUNT_ID"),
+        GEMINI_API_KEY=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"),
+    )
+except ValidationError as e:
+    print("🛑 Critical: Chat settings validation error:")
+    print(e.json(indent=2))
+    sys.exit(1)
+
+
+@dataclass
+class Deps:
+    """Dependencies required for the Agent and its Tools."""
+    supabase: Client
+    cloudflare: "CloudflareEmbedClient"
+    provider: GoogleProvider
+
+
+# ----------------------------------------
+# 2) Cloudflare Client (Embedding)
+# ----------------------------------------
+class CloudflareEmbedClient:
+    """Cloudflare Embedding Class."""
+    def __init__(self, config: Settings):
+        self.api_url = (
+            f"https://api.cloudflare.com/client/v4/accounts/"
+            f"{config.CLOUDFLARE_ACCOUNT_ID}/ai/run/{config.CLOUDFLARE_EMBED_MODEL}"
+        )
+        self.headers = {
+            "Authorization": f"Bearer {config.CLOUDFLARE_API_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        self.client = httpx.AsyncClient(timeout=30)
+        self.config = config
+        self._cache = {}
+
+    async def embed_query_async(self, text: str) -> Optional[List[float]]:
+        if text in self._cache:
+            return self._cache[text]
+
+        payload = {"text": [f"query: {text}"]}
+        MAX_RETRIES = 3
+        base_delay = 5
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await self.client.post(
+                    self.api_url, headers=self.headers, json=payload
+                )
+                response.raise_for_status()
+                vector = response.json().get("result", {}).get("data", [[]])[0]
+
+                if not vector or len(vector) != self.config.FALLBACK_EMBED_DIM:
+                    return None
+
+                self._cache[text] = vector
+                return vector
+
+            except Exception:
+                await asyncio.sleep(base_delay * (2**attempt) + random.uniform(0, 1))
+                continue
+
+        return None
+
+    async def close(self):
+        await self.client.aclose()
+
+
+# ----------------------------------------
+# 3) Main Agent and Chained Tools
+# ----------------------------------------
+
+SYSTEM_PROMPT = """
+You are a highly capable RAG assistant, specialized in **internal organizational knowledge (Snapp and its subsidiaries)**. 
+Your primary language for **all outputs must be Farsi (Farsi)**. You must not respond in any other language.
+
+**Tool Usage Rules (Chain Execution):**
+1. **Always** start by calling the `generate_search_queries` tool. This tool helps Gemini convert the user's query into optimized search queries.
+2. Next, pass the JSON output from `generate_search_queries` as input to the `final_retrieve` tool.
+
+**Response Rules:**
+If `final_retrieve` returns relevant information:
+1. You **must** use the retrieved content to formulate your response in Farsi.
+2. Start your answer with the phrase "بر اساس منبع دانش،...".
+3. **(Revised):** If the retrieved content contains multiple contradictory or fragmented data points, **provide the answer in the shortest, most direct way possible** and avoid long lists. If a single answer is not available, only mention the most important piece of information.
+4. **Attention:** Always consider the past conversation context (if provided in the input) and maintain semantic coherence.
+
+If `final_retrieve` could not find relevant information:
+1. Clearly state in Farsi that the information is not available in the knowledge base. (Example: "این اطلاعات در دیتابیس داخلی موجود نیست.")
+2. Do not use your general knowledge.
+"""
+
+agent = Agent(
+    GoogleModel(model_name=config.GEMINI_MODEL),
+    deps_type=Deps,
+    system_prompt=SYSTEM_PROMPT,
+)
+
+# 💡 Tool 1: Rewrites the user query (with emphasis on statistics)
+@agent.tool
+async def generate_search_queries(context: RunContext[Deps], search_query: str) -> RewrittenQueries:
+    """
+    Analyzes the user's ambiguous or vague search query and rewrites it into 1-3 highly specific 
+    and optimized queries that are better suited for vector similarity search. 
+    The output is used as input for the 'final_retrieve' tool.
+    """
+    print(f"⏳ Agent is instructing Gemini to rewrite query based on the prompt/history...")
+    
+    return f"""
+    Original Query (including history): "{search_query}"
+    
+    You are a Query Rewriter. Convert this query into 1 to 3 highly specific and optimized Farsi queries for vector search. 
+    If the original query is ambiguous (like an incomplete phrase) or hints at statistics, **at least one of the rewritten queries MUST include Farsi words like 'تعداد' (Tedad - Count) or 'آمار' (Aamār - Statistics)** to ensure specific data retrieval.
+    
+    **Your output MUST ONLY be a JSON Markdown code block** that follows the RewrittenQueries model, with no extra text.
+    Example:
+    ```json
+    {{
+        "search_queries": ["query 1", "query 2"]
+    }}
+    ```
+    """
+
+
+# 💡 Tool 2: Executes the optimized search
+@agent.tool
+async def final_retrieve(context: RunContext[Deps], queries_json: str) -> str:
+    """
+    Executes the vector search in Supabase using the list of optimized queries generated 
+    by the 'generate_search_queries' tool (the previous step in the chain).
+    """
+
+    search_queries: List[str] = []
+    
+    # 1. Clean JSON extraction
+    clean_json = queries_json.strip()
+    if clean_json.startswith("```json"):
+        clean_json = clean_json.strip("```json").strip("```").strip()
+
+    try:
+        # 2. Convert JSON output to Pydantic model
+        query_data = json.loads(clean_json)
+        query_model = TypeAdapter(RewrittenQueries).validate_python(query_data)
+        search_queries = query_model.search_queries
+        print(f"✅ Received optimized queries: {search_queries}")
+    except Exception as e:
+        # 3. Fallback: Invalid JSON (Stability)
+        print(f"🛑 ERROR: Failed to parse rewritten queries JSON. Details: {e}")
+        search_queries = [queries_json] 
+        search_queries = [q.replace('"', '').replace('[', '').replace(']', '').strip() for q in search_queries if q.strip()]
+        if not search_queries or search_queries == [""]:
+             print("⚠️ Fallback resulted in an empty search query. Using generic fallback.")
+             search_queries = [""]
+
+
+    all_results = []
+    
+    # 4. Execute search for all optimized queries
+    async def _retrieve_one(q: str):
+        if not q.strip(): return []
+        print(f"⏳ Creating embedding and searching for: {q}")
+        vec = await context.deps.cloudflare.embed_query_async(q)
+        if vec is None: return []
+
+        try:
+            res = context.deps.supabase.rpc(
+                "match_site_pages",
+                {"query_embedding": vec, "match_count": config.TOP_K_RETRIEVAL},
+            ).execute()
+            return res.data or []
+        except Exception as e:
+            print(f"🛑 ERROR: Supabase query failed for {q}. Details: {e}")
+            return []
+
+    # Run searches concurrently
+    all_results = await asyncio.gather(*[_retrieve_one(q) for q in search_queries])
+    items_raw = [x for sub in all_results for x in sub]
+
+
+    # 5. Parse + Dedup + Filter
+    seen_ids: Set[int] = set()
+    items: List[RetrievedChunk] = []
+    for d in items_raw:
+        try:
+            ch = RetrievedChunk(**d)
+        except ValidationError:
+            continue
+
+        if ch.id in seen_ids: continue
+        seen_ids.add(ch.id)
+        items.append(ch)
+
+    if not items:
+        return "No highly relevant documents found for this query." # Translated
+
+    # 6. Sort + Dynamic Threshold
+    items.sort(key=lambda x: x.similarity, reverse=True)
+    # Applying the lowered threshold of 0.4
+    filtered = [c for c in items if c.similarity >= config.SIMILARITY_THRESHOLD] 
+    if not filtered:
+        # If no chunk passes the threshold, send the top 3 best available chunks as a fallback
+        filtered = items[:3]
+
+    # 7. Structured output for the main Agent
+    final_items = []
+    for c in filtered[:8]:
+        final_items.append(
+            {
+                "title": c.title,
+                "url": c.url,
+                "similarity": round(c.similarity, 3),
+                "chunk_number": c.chunk_number,
+                "content": c.content[:1200], # Limiting content length to prevent token overflow
+            }
+        )
+    print(f"✅ Found {len(final_items)} relevant chunks.")
+
+    return json.dumps(final_items, ensure_ascii=False)
+
+
+# ----------------------------------------
+# 4) Interactive Chat Execution (with History)
+# ----------------------------------------
+async def main_chat_loop():
+
+    # Set code page for Farsi display on Windows
+    if sys.platform == "win32":
+        try:
+            os.system('chcp 65001') 
+            print("✅ Code page set to UTF-8 (65001) for correct Persian display.")
+        except:
+            print("⚠️ Could not set code page to UTF-8. Persian display may be corrupted.")
+            
+    try:
+        supabase_client: Client = create_client(
+            config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY
+        )
+        cloudflare_client = CloudflareEmbedClient(config)
+        google_provider = GoogleProvider(api_key=config.GEMINI_API_KEY)
+
+        deps = Deps(
+            supabase=supabase_client,
+            cloudflare=cloudflare_client,
+            provider=google_provider,
+        )
+    except Exception as e:
+        print(f"🛑 Critical Initialization Error: {e}")
+        return
+
+    # Short-Term Memory setup
+    history: List[str] = []
+    MAX_HISTORY_PAIRS = 7
+
+    print("\n=============================================")
+    print(f"💬 RAG Chat Assistant (Powered by {config.GEMINI_MODEL})")
+    print("=============================================")
+    print("Type 'exit' or 'quit' to end the session.")
+    print("---------------------------------------------")
+
+    while True:
+        try:
+            user_input = await asyncio.to_thread(input, "👤 You: ")
+
+            if user_input.lower() in ["exit", "quit"]:
+                break
+            if not user_input.strip():
+                continue
+
+            start_time = asyncio.get_event_loop().time()
+
+            # 1. Build history context for injection
+            history_context = "\n".join(history)
+            if history_context:
+                history_context = (
+                    "--- Past Conversation Context (Important) ---\n"
+                    + history_context 
+                    + "\n--- End of Context ---\n\n"
+                )
+            
+            # Send history + new query to the Agent
+            full_prompt = history_context + "Current User Query: " + user_input
+
+            print(f"✅ Agent ready. Processing: '{user_input}'")
+            
+            # Execute the Agent run
+            answer = await agent.run(full_prompt, deps=deps)
+
+            end_time = asyncio.get_event_loop().time()
+
+            # 2. Update history
+            history.append(f"User: {user_input}")
+            clean_answer = answer.output.split('\nTool Call: ')[0].strip() 
+            history.append(f"Assistant: {clean_answer}")
+
+            # 3. Trim history
+            if len(history) > 2 * MAX_HISTORY_PAIRS:
+                history = history[-(2 * MAX_HISTORY_PAIRS):]
+            
+            print("\n================ ANSWER =================")
+            print(answer.output)
+            print(f"⏱️ Total Latency: {end_time - start_time:.2f}s")
+            print("=========================================")
+
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print("\n🛑 AGENT RUNTIME ERROR:")
+            print(f"Details: {e}")
+            if "403" in str(e) or "Authentication" in str(e):
+                print("🚨 API Key Error: It seems your Gemini API Key is invalid or rate-limited.")
+            break
+
+    await cloudflare_client.close()
+    print("👋 Session ended. Clients closed.")
+
+
+if __name__ == "__main__":
+    # Correct handling of the async event loop
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            print("⚠️ Note: Event loop is already running. Scheduling main_chat_loop as a task.")
+            loop.create_task(main_chat_loop())
+            # In interactive environments, run_forever might hang or be unnecessary.
+            # Assuming a standard script execution environment for the sake of completion.
+            loop.run_forever() 
+        else:
+            asyncio.run(main_chat_loop())
+    except Exception as e:
+        print(f"❌ Async Runtime Error: {e}")
+        # Final fallback for environments that handle the loop differently (e.g., Jupyter, IDLE)
+        try:
+            asyncio.run(main_chat_loop())
+        except Exception as fallback_e:
+            print(f"❌ Final Fallback Error: {fallback_e}")
