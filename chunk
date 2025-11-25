@@ -1,0 +1,536 @@
+import os
+import asyncio
+import random
+import re
+import json
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import sys
+import httpx
+from collections import deque
+
+from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from dotenv import load_dotenv, find_dotenv
+
+# --- Supabase ---
+try:
+    from supabase import create_client, Client
+except ImportError:
+    print("🛑 Critical: pip install supabase python-dotenv python-docx httpx pydantic-ai")
+    sys.exit(1)
+
+# --- Pydantic-AI + Gemini (Optional) ---
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.providers.google import GoogleProvider
+
+
+# =========================================================
+# 0) مسیر فایل را اینجا بگذار (هیچ ورودی از ترمینال نمی‌گیریم)
+# =========================================================
+LOCAL_DOCUMENT_FILE = r"C:\Users\KIMI\Desktop\n8n-local\crawl4AI-agent\doc\New Microsoft Word Document.docx"
+# اگر txt/md:
+# LOCAL_DOCUMENT_FILE = r"C:\path\to\file.txt"
+
+
+# ----------------------------------------
+# ۱) تنظیمات و env
+# ----------------------------------------
+load_dotenv(find_dotenv(), override=True)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_EMBED_MODEL = "@cf/baai/bge-m3"
+
+FALLBACK_EMBED_DIM = 1024
+
+# semantic chunking
+MAX_CHUNK_SIZE = 700
+CHUNK_OVERLAP = 150
+
+# Gemini (اختیاری - فقط برای SUMMARY)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+RAW_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+USE_GEMINI = os.getenv("USE_GEMINI_SUMMARY", "1") == "1"
+
+
+def normalize_gemini_model(name: str) -> str:
+    name = (name or "").strip()
+    if ":" in name:
+        name = name.split(":")[-1].strip()
+    if "/" in name:
+        name = name.split("/")[-1].strip()
+    return name or "gemini-2.5-flash"
+
+
+GEMINI_MODEL = normalize_gemini_model(RAW_GEMINI_MODEL)
+
+if not all([SUPABASE_URL, SUPABASE_SERVICE_KEY, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID]):
+    print("🛑 Critical: Supabase + Cloudflare keys must be set in .env")
+    sys.exit(1)
+
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    print("✅ Supabase client initialized.")
+except Exception as e:
+    print(f"❌ Could not initialize Supabase client: {e}")
+    sys.exit(1)
+
+
+# ----------------------------------------
+# ۲) مدل خروجی جمنای (فقط SUMMARY)
+# ----------------------------------------
+class SummaryOnly(BaseModel):
+    summary: str = Field(..., description="خلاصه 2 تا 4 جمله‌ای از محتوای چانک")
+
+
+SUMMARY_SYSTEM_PROMPT = """
+تو یک دستیار برای تولید فقط Summary هستی.
+- خروجی باید فقط JSON معتبر مطابق اسکیمای داده شود.
+- summary: 2 تا 4 جمله‌ی فارسی روان که نکات اصلی را بگوید.
+- هیچ متن اضافه خارج از JSON ننویس.
+"""
+
+summary_agent: Optional[Agent] = None
+GEMINI_BROKEN = False
+
+if USE_GEMINI and GEMINI_API_KEY:
+    try:
+        google_provider = GoogleProvider(api_key=GEMINI_API_KEY)
+        summary_agent = Agent(
+            GoogleModel(model_name=GEMINI_MODEL, provider=google_provider),
+            system_prompt=SUMMARY_SYSTEM_PROMPT,
+        )
+        print(f"🤖 Gemini summary enabled | Model: {GEMINI_MODEL}")
+    except Exception as e:
+        print(f"⚠️ Gemini init failed, will fallback only. Error: {e}")
+        summary_agent = None
+        USE_GEMINI = False
+else:
+    print("ℹ️ Gemini summary disabled (USE_GEMINI_SUMMARY=0 or missing key).")
+
+
+# ----------------------------------------
+# ۲.۵) Rate limit برای Gemini: 3 request / minute
+# ----------------------------------------
+GEMINI_MAX_CALLS_PER_MIN = 3
+_gemini_call_times = deque()
+
+async def gemini_rate_limiter():
+    now = asyncio.get_event_loop().time()
+    while _gemini_call_times and (now - _gemini_call_times[0] > 60):
+        _gemini_call_times.popleft()
+
+    if len(_gemini_call_times) >= GEMINI_MAX_CALLS_PER_MIN:
+        wait_time = 60 - (now - _gemini_call_times[0])
+        wait_time = max(wait_time, 0.0)
+        print(f"⏳ Gemini rate-limit: waiting {wait_time:.2f}s to keep 3 req/min")
+        await asyncio.sleep(wait_time)
+
+        now = asyncio.get_event_loop().time()
+        while _gemini_call_times and (now - _gemini_call_times[0] > 60):
+            _gemini_call_times.popleft()
+
+    _gemini_call_times.append(asyncio.get_event_loop().time())
+
+
+# ----------------------------------------
+# ۳) کلاس Embedding Cloudflare
+# ----------------------------------------
+@dataclass
+class ProcessedChunk:
+    url: str
+    chunk_number: int
+    title: str
+    summary: str
+    content: str
+    metadata: Dict[str, Any]
+    embedding: Optional[List[float]]
+
+
+class CloudflareEmbedClient:
+    def __init__(self, api_token: str, account_id: str, embed_model: str, dim: int):
+        self.dim = dim
+        self.api_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{embed_model}"
+        self.headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
+        }
+        self.client = httpx.AsyncClient(timeout=30)
+
+    async def embed_content_direct(self, text: str) -> Optional[List[float]]:
+        MAX_RETRIES = 3
+        base_delay = 5
+        payload = {"text": [f"passage: {text}"]}
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await self.client.post(self.api_url, headers=self.headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                vector = data.get("result", {}).get("data", [[]])[0]
+
+                if not vector or len(vector) != self.dim:
+                    print(f"❌ Cloudflare returned {len(vector)} dims, expected {self.dim}. Skipping.")
+                    return None
+
+                return vector
+
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (429, 500, 503) and attempt < MAX_RETRIES - 1:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    print(f"⚠️ CF error {e.response.status_code}. Retry in {delay:.2f}s")
+                    await asyncio.sleep(delay)
+                    continue
+                print(f"❌ CF API Error {e.response.status_code}: {e.response.text[:120]}...")
+                return None
+
+            except Exception as e:
+                print(f"❌ CF General Error: {type(e).__name__}: {e}")
+                return None
+
+        return None
+
+    async def close(self):
+        await self.client.aclose()
+
+
+cloudflare_embed_client = CloudflareEmbedClient(
+    CLOUDFLARE_API_TOKEN,
+    CLOUDFLARE_ACCOUNT_ID,
+    CLOUDFLARE_EMBED_MODEL,
+    FALLBACK_EMBED_DIM
+)
+
+
+# ----------------------------------------
+# ۴) استخراج DOCX + جدول‌ها
+# ----------------------------------------
+def extract_table_text(table: Table) -> str:
+    table_data = ["--- TABLE START ---"]
+    for i, row in enumerate(table.rows):
+        row_text = []
+        for j, cell in enumerate(row.cells):
+            cell_content = cell.text.replace('\n', ' ').strip()
+            row_text.append(f"[C{j+1}: {cell_content}]")
+        table_data.append(f"Row {i+1}: {' '.join(row_text)}")
+    table_data.append("--- TABLE END ---")
+    return '\n'.join(table_data)
+
+
+def extract_text_from_docx(file_path: str) -> str:
+    try:
+        document = Document(file_path)
+        full_content = []
+        for element in document.element.body:
+            if element.tag.endswith('p'):
+                paragraph = Paragraph(element, document)
+                text = paragraph.text.strip()
+                if text:
+                    full_content.append(text)
+            elif element.tag.endswith('tbl'):
+                table = Table(element, document)
+                table_text = extract_table_text(table)
+                if table_text:
+                    full_content.append('\n' + table_text + '\n')
+        return '\n\n'.join(full_content)
+    except Exception as e:
+        print(f"❌ Error extracting text from DOCX: {e}")
+        return ""
+
+
+# ----------------------------------------
+# ۵) Chunking معنی‌دار و بدون قطع وسط کلمه
+# ----------------------------------------
+SENT_SPLIT_REGEX = r'(?<=[\.\!\?\u061F\u06D4\u061B؛!؟])\s+'
+
+def split_long_sentence(sentence: str, max_size: int) -> List[str]:
+    words = sentence.split()
+    parts, cur = [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > max_size and cur:
+            parts.append(cur.strip())
+            cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    if cur:
+        parts.append(cur.strip())
+    return parts
+
+
+def chunk_text_by_sentence(text: str, max_size: int = MAX_CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    sentences = re.split(SENT_SPLIT_REGEX, text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return []
+
+    norm_sentences: List[str] = []
+    for s in sentences:
+        if len(s) > max_size:
+            norm_sentences.extend(split_long_sentence(s, max_size))
+        else:
+            norm_sentences.append(s)
+
+    chunks, current_chunk = [], ""
+    for sentence in norm_sentences:
+        if len(current_chunk) + len(sentence) + 1 > max_size and current_chunk:
+            chunks.append(current_chunk.strip())
+            tail = current_chunk[-overlap:] if overlap > 0 else ""
+            current_chunk = (tail + " " + sentence).strip()
+        else:
+            current_chunk = (current_chunk + " " + sentence).strip()
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+def first_n_lines_summary(chunk: str, n: int = 3) -> str:
+    lines = [l.strip() for l in chunk.splitlines() if l.strip()]
+    if not lines:
+        return chunk.strip()[:300]
+    return " ".join(lines[:n])[:300]
+
+
+# ----------------------------------------
+# ۵.۵) Title fallback حرفه‌ای + ضدتکرار (Title فقط از همین میاد)
+# ----------------------------------------
+STOP_TITLES = [
+    "گزارش عملکرد", "گزارش سالانه", "اسنپ", "snap",
+    "New Microsoft Word Document", "TABLE START", "TABLE END",
+    "صورت‌های مالی", "مقدمه", "فهرست", "چکیده"
+]
+
+def is_bad_title(line: str) -> bool:
+    l = line.strip().lower()
+    if len(l) < 8:
+        return True
+    if any(st.lower() in l for st in STOP_TITLES):
+        return len(l) < 35
+    if re.fullmatch(r"[\d\W_]+", l):
+        return True
+    return False
+
+def extract_keywords(text: str, k: int = 3) -> List[str]:
+    words = re.findall(r"[A-Za-zآ-ی۰-۹]+", text)
+    words = [w for w in words if len(w) > 2]
+    freq: Dict[str, int] = {}
+    for w in words:
+        freq[w] = freq.get(w, 0) + 1
+    top = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+    return [w for w, _ in top[:k]]
+
+def dedup_title(title: str, chunk: str, prev_title: Optional[str]) -> str:
+    t = title.strip()
+    if not prev_title:
+        return t
+    if t[:25] == prev_title.strip()[:25]:
+        kws = extract_keywords(chunk, k=3)
+        if kws:
+            return f"{t} | " + "، ".join(kws)
+    return t
+
+def build_title_fallback(chunk: str, prev_title: Optional[str]) -> str:
+    lines = [l.strip() for l in chunk.splitlines() if l.strip()]
+    title = None
+    for line in lines[:8]:
+        if not is_bad_title(line):
+            title = line[:120]
+            break
+    if not title:
+        title = (lines[0][:80] if lines else "Untitled")
+    return dedup_title(title, chunk, prev_title)
+
+
+# ----------------------------------------
+# ۶) Gemini SUMMARY only + rate limit + خاموش شدن خودکار
+# ----------------------------------------
+async def gemini_summary_only(chunk: str) -> Optional[str]:
+    global GEMINI_BROKEN
+
+    if summary_agent is None or GEMINI_BROKEN:
+        return None
+
+    try:
+        await gemini_rate_limiter()
+
+        result = await summary_agent.run(chunk)
+        text = (result.output or "").strip()
+
+        m = re.search(r'\{.*\}', text, flags=re.DOTALL)
+        if not m:
+            return None
+
+        json_str = m.group(0)
+        obj = SummaryOnly.model_validate_json(json_str)
+        return obj.summary.strip()
+
+    except Exception as e:
+        msg = str(e)
+        if "unexpected model name format" in msg or "INVALID_ARGUMENT" in msg:
+            GEMINI_BROKEN = True
+            print("⚠️ Gemini model format error. Disabling Gemini summaries for rest of run.")
+        print(f"⚠️ Gemini summary failed: {type(e).__name__}: {e}")
+        return None
+
+
+# ----------------------------------------
+# ۷) ساخت embedding + آماده‌سازی چانک
+# ----------------------------------------
+async def process_chunk(chunk: str, chunk_number: int, url: str, prev_title: Optional[str]) -> Optional[ProcessedChunk]:
+    # ✅ Title همیشه fallback
+    title = build_title_fallback(chunk, prev_title=prev_title)
+
+    # ✅ Summary با Gemini (اختیاری)
+    summary = await gemini_summary_only(chunk)
+    if summary:
+        summary = summary[:400]
+        llm_summary_used = True
+    else:
+        summary = first_n_lines_summary(chunk, n=3)
+        llm_summary_used = False
+
+    meta_chunk = f"Title: {title}\nSummary: {summary}\n\nCONTENT:\n{chunk}"
+    embedding = await cloudflare_embed_client.embed_content_direct(meta_chunk)
+
+    if embedding is None or len(embedding) != FALLBACK_EMBED_DIM:
+        print(f"🛑 Embedding failed for chunk {chunk_number}. Skipping.")
+        return None
+
+    return ProcessedChunk(
+        url=url,
+        chunk_number=chunk_number,
+        title=title,
+        summary=summary,
+        content=chunk,
+        embedding=embedding,
+        metadata={
+            "source": url,
+            "chunk_length": len(chunk),
+            "llm_summary_used": llm_summary_used,
+            "embedding_model": CLOUDFLARE_EMBED_MODEL,
+            "retrieved_at": datetime.now(timezone.utc).isoformat()
+        }
+    )
+
+
+# ----------------------------------------
+# ۸) insertion به Supabase
+# ----------------------------------------
+async def insert_chunk(chunk: ProcessedChunk):
+    if chunk.embedding is None or len(chunk.embedding) != FALLBACK_EMBED_DIM:
+        print(f"🛑 Skip insert chunk {chunk.chunk_number}: invalid embedding.")
+        return None
+
+    try:
+        data = {
+            "url": chunk.url,
+            "chunk_number": chunk.chunk_number,
+            "title": chunk.title,
+            "summary": chunk.summary,
+            "content": chunk.content,
+            "metadata": chunk.metadata,
+            "embedding": chunk.embedding
+        }
+        result = supabase.table("site_pages").insert(data).execute()
+        print(f"✅ Inserted chunk {chunk.chunk_number} for {chunk.url}")
+        return result
+
+    except Exception as e:
+        if "duplicate key value violates unique constraint" in str(e):
+            print(f"⚠️ Chunk {chunk.chunk_number} already exists. Skipped.")
+        else:
+            print(f"❌ Insert error: {e}")
+        return None
+
+
+# ----------------------------------------
+# ۹) پردازش و ذخیره کل سند
+# ----------------------------------------
+async def process_and_store_document(url: str, content: str):
+    chunks = chunk_text_by_sentence(content)
+    print(f"Divided document into {len(chunks)} semantic chunks (meaningful, no mid-word cuts).")
+
+    processed_chunks: List[ProcessedChunk] = []
+    prev_title: Optional[str] = None
+
+    for i, chunk in enumerate(chunks, start=1):
+        if not chunk.strip():
+            continue
+
+        print(f"\n⚙️ Processing Chunk {i}/{len(chunks)} (Len: {len(chunk)})")
+
+        try:
+            pc = await process_chunk(chunk, i, url, prev_title=prev_title)
+            if pc:
+                processed_chunks.append(pc)
+                prev_title = pc.title  # ✅ برای ضدتکرار چانک بعدی
+
+            delay = 0.4 + random.uniform(0, 0.4)
+            await asyncio.sleep(delay)
+
+        except Exception as e:
+            print(f"❌ Error processing chunk {i}: {type(e).__name__}: {e}")
+
+    print("\nStarting SERIAL insertion to Supabase...")
+    for c in processed_chunks:
+        await insert_chunk(c)
+
+
+async def process_local_file(file_path: str):
+    source_name = os.path.basename(file_path)
+
+    if file_path.lower().endswith(".docx"):
+        print(f"📄 Processing DOCX: {source_name}")
+        content = extract_text_from_docx(file_path)
+
+    elif file_path.lower().endswith((".txt", ".md")):
+        print(f"📄 Processing Text/MD: {source_name}")
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+    else:
+        print("🛑 Unsupported file type.")
+        return
+
+    content_length = len(content.strip())
+    print(f"💡 Extracted content length: {content_length} characters.")
+
+    if not content_length:
+        print("🛑 Extracted content is empty. Stop.")
+        return
+
+    source_url = f"file://{file_path}"
+    await process_and_store_document(source_url, content)
+    print(f"\n✅ Finished RAG pipeline for local file: {file_path}")
+
+
+# ----------------------------------------
+# ۱۰) main
+# ----------------------------------------
+async def main():
+    if not os.path.exists(LOCAL_DOCUMENT_FILE):
+        print(f"❌ Document file not found at: {LOCAL_DOCUMENT_FILE}")
+        return
+
+    print(f"🚀 Starting RAG Pipeline | Embed Model: {CLOUDFLARE_EMBED_MODEL} ({FALLBACK_EMBED_DIM} Dim)")
+    print(f"🤖 Gemini Summary Enabled: {bool(summary_agent)} | Model: {GEMINI_MODEL} | Limit: 3 req/min")
+    print("-----------------------------------------------------------------")
+
+    try:
+        await process_local_file(LOCAL_DOCUMENT_FILE)
+    finally:
+        print("\n🧹 Closing Cloudflare client...")
+        await cloudflare_embed_client.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
