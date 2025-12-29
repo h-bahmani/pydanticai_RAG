@@ -38,7 +38,7 @@ LOCAL_DOCUMENT_FILE = r"C:\Users\KIMI\Desktop\n8n-local\crawl4AI-agent\doc\New M
 
 
 # ----------------------------------------
-# ۱) تنظیمات و env
+# 1) تنظیمات و env
 # ----------------------------------------
 load_dotenv(find_dotenv(), override=True)
 
@@ -85,7 +85,7 @@ except Exception as e:
 
 
 # ----------------------------------------
-# ۲) مدل خروجی جمنای (فقط SUMMARY)
+# 2) مدل خروجی جمنای (فقط SUMMARY)
 # ----------------------------------------
 class SummaryOnly(BaseModel):
     summary: str = Field(..., description="خلاصه 2 تا 4 جمله‌ای از محتوای چانک")
@@ -118,7 +118,7 @@ else:
 
 
 # ----------------------------------------
-# ۲.۵) Rate limit برای Gemini: 3 request / minute
+#  Rate limit برای Gemini: 3 request / minute
 # ----------------------------------------
 GEMINI_MAX_CALLS_PER_MIN = 3
 _gemini_call_times = deque()
@@ -142,7 +142,7 @@ async def gemini_rate_limiter():
 
 
 # ----------------------------------------
-# ۳) کلاس Embedding Cloudflare
+# 3) کلاس Embedding Cloudflare
 # ----------------------------------------
 @dataclass
 class ProcessedChunk:
@@ -211,7 +211,7 @@ cloudflare_embed_client = CloudflareEmbedClient(
 
 
 # ----------------------------------------
-# ۴) استخراج DOCX + جدول‌ها
+# 4) استخراج DOCX + جدول‌ها
 # ----------------------------------------
 def extract_table_text(table: Table) -> str:
     table_data = ["--- TABLE START ---"]
@@ -247,7 +247,7 @@ def extract_text_from_docx(file_path: str) -> str:
 
 
 # ----------------------------------------
-# ۵) Chunking معنی‌دار و بدون قطع وسط کلمه
+# 5) Chunking معنی‌دار و بدون قطع وسط کلمه
 # ----------------------------------------
 SENT_SPLIT_REGEX = r'(?<=[\.\!\?\u061F\u06D4\u061B؛!؟])\s+'
 
@@ -301,7 +301,7 @@ def first_n_lines_summary(chunk: str, n: int = 3) -> str:
 
 
 # ----------------------------------------
-# ۵.۵) Title fallback حرفه‌ای + ضدتکرار (Title فقط از همین میاد)
+#  Title fallback حرفه‌ای + ضدتکرار (Title فقط از همین میاد)
 # ----------------------------------------
 STOP_TITLES = [
     "گزارش عملکرد", "گزارش سالانه", "اسنپ", "snap",
@@ -351,7 +351,7 @@ def build_title_fallback(chunk: str, prev_title: Optional[str]) -> str:
 
 
 # ----------------------------------------
-# ۶) Gemini SUMMARY only + rate limit + خاموش شدن خودکار
+# 6) Gemini SUMMARY only + rate limit  
 # ----------------------------------------
 async def gemini_summary_only(chunk: str) -> Optional[str]:
     global GEMINI_BROKEN
@@ -383,7 +383,7 @@ async def gemini_summary_only(chunk: str) -> Optional[str]:
 
 
 # ----------------------------------------
-# ۷) ساخت embedding + آماده‌سازی چانک
+# 7) ساخت embedding + آماده‌سازی چانک
 # ----------------------------------------
 async def process_chunk(chunk: str, chunk_number: int, url: str, prev_title: Optional[str]) -> Optional[ProcessedChunk]:
     # ✅ Title همیشه fallback
@@ -423,7 +423,7 @@ async def process_chunk(chunk: str, chunk_number: int, url: str, prev_title: Opt
 
 
 # ----------------------------------------
-# ۸) insertion به Supabase
+# 8) insertion به Supabase
 # ----------------------------------------
 async def insert_chunk(chunk: ProcessedChunk):
     if chunk.embedding is None or len(chunk.embedding) != FALLBACK_EMBED_DIM:
@@ -453,7 +453,7 @@ async def insert_chunk(chunk: ProcessedChunk):
 
 
 # ----------------------------------------
-# ۹) پردازش و ذخیره کل سند
+# 9) پردازش و ذخیره کل سند
 # ----------------------------------------
 async def process_and_store_document(url: str, content: str):
     chunks = chunk_text_by_sentence(content)
@@ -514,7 +514,7 @@ async def process_local_file(file_path: str):
 
 
 # ----------------------------------------
-# ۱۰) main
+# 10) main
 # ----------------------------------------
 async def main():
     if not os.path.exists(LOCAL_DOCUMENT_FILE):
