@@ -1,0 +1,604 @@
+
+
+
+# hybrid.py
+# Hybrid RAG (FTS + Vector) -> (merge) -> Rerank -> Build Context -> Answer (Groq via pydantic-ai)
+# Requires:
+#   pip install supabase pydantic-ai python-dotenv httpx pydantic
+# Optional (reranker):
+#   pip install torch FlagEmbedding
+
+
+import os
+import re
+import json
+import time
+import asyncio
+import threading
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from dotenv import load_dotenv, find_dotenv
+from pydantic import BaseModel
+from supabase import create_client, Client
+
+from pydantic_ai import Agent
+from pydantic_ai.models.groq import GroqModel
+from pydantic_ai.providers.groq import GroqProvider
+
+try:
+    import torch  # noqa: F401
+    from FlagEmbedding import FlagReranker
+except Exception:
+    FlagReranker = None
+
+load_dotenv(find_dotenv(), override=True)
+
+
+# -------------------------
+# Settings
+# -------------------------
+class Settings(BaseModel):
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+    SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+    CLOUDFLARE_API_TOKEN: str = os.getenv("CLOUDFLARE_API_TOKEN", "")
+    CLOUDFLARE_ACCOUNT_ID: str = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "meta-llama/llama-4-maverick-17b-128e-instruct")
+
+    # DB RPC names
+    FTS_RPC: str = os.getenv("FTS_RPC", "full_text_search")
+    VEC_RPC: str = os.getenv("VEC_RPC", "match_site_pages")
+
+    # retrieval sizes
+    FTS_MATCH_COUNT: int = int(os.getenv("FTS_MATCH_COUNT", "15"))
+    VEC_MATCH_COUNT: int = int(os.getenv("VEC_MATCH_COUNT", "15"))
+
+    # rerank + context
+    FINAL_TOP: int = int(os.getenv("FINAL_TOP", "3"))
+    NEIGHBOR_WINDOW: int = int(os.getenv("NEIGHBOR_WINDOW", "1"))  # add next chunks [n..n+window]
+    MAX_CHARS_PER_CHUNK: int = int(os.getenv("MAX_CHARS_PER_CHUNK", "2200"))
+    MAX_CHARS_CONTEXT: int = int(os.getenv("MAX_CHARS_CONTEXT", "6500"))
+
+    # debug
+    DEBUG_SAVE_JSON: int = int(os.getenv("DEBUG_SAVE_JSON", "1"))
+    DEBUG_TOP_N: int = int(os.getenv("DEBUG_TOP_N", "8"))
+
+    # reranker model (optional)
+    RERANKER_MODEL: str = os.getenv("RERANKER_MODEL", "Alibaba-NLP/gte-multilingual-reranker-base")
+
+
+config = Settings()
+
+
+# -------------------------
+# Deps
+# -------------------------
+@dataclass
+class Deps:
+    supabase: Client
+    cloudflare: "CloudflareEmbedClient"
+    reranker: "RerankerClient"
+
+
+# -------------------------
+# Clients
+# -------------------------
+class CloudflareEmbedClient:
+    def __init__(self) -> None:
+        if not config.CLOUDFLARE_ACCOUNT_ID or not config.CLOUDFLARE_API_TOKEN:
+            raise RuntimeError("CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN not set")
+
+        self.api_url = (
+            f"https://api.cloudflare.com/client/v4/accounts/"
+            f"{config.CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/baai/bge-m3"
+        )
+        self.headers = {"Authorization": f"Bearer {config.CLOUDFLARE_API_TOKEN}"}
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def aclient(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=45)
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def embed(self, text: str) -> List[float]:
+        c = await self.aclient()
+        r = await c.post(self.api_url, headers=self.headers, json={"text": [f"query: {text}"]})
+        r.raise_for_status()
+        data = r.json()
+        return data["result"]["data"][0]
+
+
+class RerankerClient:
+    """
+    Fixes the "Already borrowed" style errors by serializing access with a Lock.
+    """
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.model = None
+        self.initialized = False
+
+        if FlagReranker is None:
+            return
+
+        try:
+            self.model = FlagReranker(config.RERANKER_MODEL, use_fp16=True, trust_remote_code=True)
+            self.initialized = True
+        except Exception:
+            self.model = None
+            self.initialized = False
+
+    def compute_scores(self, query: str, docs: List[str]) -> List[float]:
+        if not self.initialized or self.model is None:
+            return [0.0 for _ in docs]
+        with self.lock:
+            pairs = [[query, d] for d in docs]
+            scores = self.model.compute_score(pairs)
+            return [float(x) for x in scores]
+
+
+# -------------------------
+# Supabase helpers (IMPORTANT)
+# -------------------------
+async def sb_execute(fn):
+    # supabase-py execute() is sync => run in a thread
+    return await asyncio.to_thread(fn)
+
+
+# -------------------------
+# Normalization helpers
+# -------------------------
+def clamp_text(s: str, max_chars: int) -> str:
+    s = s or ""
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "\n...(truncated)"
+
+def _as_int(x: Any) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+def normalize_item(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Make both FTS and Vector results look the same:
+      required: id, content
+      optional: url, chunk_number, similarity/score/distance, title/summary
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    _id = raw.get("id")
+    if _id is None:
+        return None
+
+    content = raw.get("content") or raw.get("page_content") or raw.get("text")
+    if not isinstance(content, str) or len(content.strip()) < 50:
+        return None
+
+    url = raw.get("url") or raw.get("source_url")
+    chunk_number = raw.get("chunk_number")
+    if chunk_number is None:
+        # some schemas store as chunk_index
+        chunk_number = raw.get("chunk_index")
+
+    item = dict(raw)
+    item["id"] = _id
+    item["content"] = content
+    item["url"] = url
+    item["chunk_number"] = _as_int(chunk_number)
+
+    # unify similarity fields
+    if item.get("similarity") is None and item.get("score") is not None:
+        item["similarity"] = item.get("score")
+    return item
+
+def short_meta(it: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": it.get("id"),
+        "source": it.get("source"),
+        "url": it.get("url"),
+        "chunk_number": it.get("chunk_number"),
+        "len": len(it.get("content") or ""),
+        "similarity": it.get("similarity"),
+        "rerank": it.get("rerank"),
+    }
+
+
+# -------------------------
+# Query rewrite (simple + debug-friendly)
+# -------------------------
+# def rewrite_queries(user_query: str) -> List[str]:
+#     # ۱. حذف نویز ابتدایی
+#     q = re.sub(r'^(سوال|پرسش|آیا|لطفا):\s*', '', user_query.strip())
+    
+#     # ۲. لیست کلمات توقف (Stop Words)
+#     stop_words = {"چند", "درصد", "کدام", "قرار", "دارند", "باشند", "توسط", "بوده"}
+    
+#     # ۳. استخراج تمام کلمات معتبر (بدون توقف و طول > ۲)
+#     all_words = [word for word in q.split() if word not in stop_words and len(word) > 2]
+    
+#     # ۴. استراتژی OR برای FTS (ترکیب کلمات)
+#     keywords_or = " | ".join(all_words)
+    
+#     # ۵. استراتژی «تیر آخر» (استخراج کلمات بسیار خاص و طولانی)
+#     # هر کلمه‌ای که طولش از ۷ حرف بیشتر باشد احتمالا یک اسم خاص یا کلمه کلیدی فنی است
+#     special_words = [word for word in all_words if len(word) >= 7]
+    
+#     # خروجی نهایی
+#     results = [q, keywords_or] # نسخه برداری و نسخه ترکیبی FTS
+    
+#     # اضافه کردن تک‌تک کلمات خاص به لیست جستجو (به صورت جداگانه)
+#     if special_words:
+#         results.extend(special_words)
+        
+#     return list(dict.fromkeys(results)) # حذف تکراری‌های احتمالی
+
+
+
+def rewrite_queries(user_query: str) -> List[str]:
+    # حذف کلمه "سوال:" از ابتدای متن اگر وجود داشت
+    q = re.sub(r'^سوال:\s*', '', user_query.strip())
+    
+    stop_words = {"چند", "درصد", "کدام", "آیا", "دسته", "قرار", "دارند", "باشند", "سوال:", "پرسشنامه"}
+    
+    # استخراج کلمات کلیدی اصلی
+    keywords = " | ".join([word for word in q.split() if word not in stop_words and len(word) > 2])
+    
+    return [
+        q,            # برای Vector
+        keywords,     # برای FTS (نسخه OR شده)
+        "غیردانش‌بنیان" # شانس مجدد برای کلمه کلیدی اصلی نیم فاصله
+    ]
+
+# -------------------------
+# Retrieval calls you were missing: call_fulltext / call_vector 
+# -------------------------
+async def call_fulltext(
+    deps: Deps,
+    query_text: str,
+    match_count: int,
+    debug: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    t0 = time.time()
+
+    resp = await sb_execute(
+        lambda: deps.supabase.rpc(
+            config.FTS_RPC,
+            {"query_text": query_text, "match_count": match_count},
+        ).execute()
+    )
+
+    raw = resp.data or []
+    items = []
+    for r in raw:
+        it = normalize_item(r)
+        if it is None:
+            continue
+        it["source"] = "fts"
+        items.append(it)
+
+    debug["fts"] = {
+        "rpc": config.FTS_RPC,
+        "query_text": query_text,
+        "match_count": match_count,
+        "raw_count": len(raw),
+        "normalized_count": len(items),
+        "time_sec": round(time.time() - t0, 3),
+        "top_preview": [short_meta(x) for x in items[: min(5, len(items))]],
+    }
+    return items
+
+
+async def call_vector(
+    deps: Deps,
+    query_text: str,
+    match_count: int,
+    debug: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    t0 = time.time()
+
+    # 1) embed
+    t_embed = time.time()
+    vec = await deps.cloudflare.embed(query_text)
+    embed_sec = time.time() - t_embed
+
+    # 2) vector RPC
+    resp = await sb_execute(
+        lambda: deps.supabase.rpc(
+            config.VEC_RPC,
+            {"query_embedding": vec, "match_count": match_count},
+        ).execute()
+    )
+
+    raw = resp.data or []
+    items = []
+    for r in raw:
+        it = normalize_item(r)
+        if it is None:
+            continue
+        it["source"] = "vec"
+        items.append(it)
+
+    debug["vector"] = {
+        "rpc": config.VEC_RPC,
+        "query_text": query_text,
+        "match_count": match_count,
+        "embed_time_sec": round(embed_sec, 3),
+        "raw_count": len(raw),
+        "normalized_count": len(items),
+        "time_sec_total": round(time.time() - t0, 3),
+        "top_preview": [short_meta(x) for x in items[: min(5, len(items))]],
+    }
+    return items
+
+
+# -------------------------
+# Merge -> Rerank (ONE rerank AFTER both results)
+# -------------------------
+async def merge_and_rerank(
+    deps: Deps,
+    query_text: str,
+    fts_items: List[Dict[str, Any]],
+    vec_items: List[Dict[str, Any]],
+    debug: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    # union by id
+    merged: Dict[Any, Dict[str, Any]] = {}
+
+    for it in fts_items:
+        merged[it["id"]] = dict(it)
+
+    for it in vec_items:
+        if it["id"] in merged:
+            merged[it["id"]].update(it)
+            merged[it["id"]]["source"] = "fts+vec"
+        else:
+            merged[it["id"]] = dict(it)
+
+    union_list = list(merged.values())
+    debug["union"] = {
+        "unique_count": len(union_list),
+        "top_preview": [short_meta(x) for x in union_list[: min(10, len(union_list))]],
+    }
+
+    # rerank union (single pass)
+    t0 = time.time()
+    docs = [it["content"] for it in union_list]
+    scores = await asyncio.to_thread(deps.reranker.compute_scores, query_text, docs)
+    for it, s in zip(union_list, scores):
+        it["rerank"] = float(s)
+
+    union_list.sort(key=lambda x: float(x.get("rerank", -1e9)), reverse=True)
+
+    topn = min(config.DEBUG_TOP_N, len(union_list))
+    debug["rerank"] = {
+        "enabled": bool(deps.reranker.initialized),
+        "time_sec": round(time.time() - t0, 3),
+        "top_scores": [float(union_list[i]["rerank"]) for i in range(topn)] if union_list else [],
+        "top_items": [short_meta(union_list[i]) for i in range(topn)] if union_list else [],
+    }
+    return union_list
+
+
+# -------------------------
+# Context builder (neighbor chunks)
+# -------------------------
+async def fetch_neighbors(
+    deps: Deps,
+    url: str,
+    chunk_number: int,
+    window: int
+) -> str:
+    chunks = [chunk_number + d for d in range(0, window + 1)]
+    resp = await sb_execute(
+        lambda: deps.supabase.table("site_pages")
+        .select("content,chunk_number")
+        .eq("url", url)
+        .in_("chunk_number", chunks)
+        .order("chunk_number")
+        .execute()
+    )
+    rows = resp.data or []
+    joined = "\n".join([r.get("content", "") for r in rows if r.get("content")])
+    return joined
+
+
+async def build_context(
+    deps: Deps,
+    ranked_items: List[Dict[str, Any]],
+    debug: Dict[str, Any]
+) -> str:
+    top = ranked_items[: config.FINAL_TOP]
+    debug["final_selected"] = [short_meta(it) for it in top]
+
+    blocks: List[str] = []
+    for i, it in enumerate(top, start=1):
+        url = it.get("url")
+        cn = it.get("chunk_number")
+
+        if not url or cn is None:
+            txt = clamp_text(it.get("content", ""), config.MAX_CHARS_PER_CHUNK)
+            blocks.append(f"--- SOURCE {i} ({it.get('source')}) ---\n{txt}")
+            continue
+
+        neigh = await fetch_neighbors(deps, url, int(cn), config.NEIGHBOR_WINDOW)
+        neigh = clamp_text(neigh, config.MAX_CHARS_PER_CHUNK)
+        blocks.append(
+            f"--- SOURCE {i} ({it.get('source')}) url={url} chunks=[{cn}..{cn+config.NEIGHBOR_WINDOW}] ---\n{neigh}"
+        )
+
+    context = "\n\n".join(blocks)
+    context = clamp_text(context, config.MAX_CHARS_CONTEXT)
+
+    debug["context_stats"] = {
+        "final_top": config.FINAL_TOP,
+        "neighbor_window": config.NEIGHBOR_WINDOW,
+        "context_chars": len(context),
+    }
+    return context
+
+
+# -------------------------
+# Answer agent (Groq)
+# -------------------------
+SYSTEM_PROMPT = """
+شما فقط باید با اتکا به CONTEXT پاسخ دهید.
+اگر پاسخ داخل CONTEXT نیست، دقیق بگویید در متنِ بازیابی‌شده نیامده.
+پاسخ را با "**بر اساس منبع گزارش هوش مصنوعی،...**" شروع کن.
+"""
+
+answer_agent = Agent(
+    GroqModel(model_name=config.GROQ_MODEL, provider=GroqProvider(api_key=config.GROQ_API_KEY)),
+    system_prompt=SYSTEM_PROMPT,
+)
+
+
+async def answer_with_context(question: str, context: str) -> str:
+    prompt = (
+        "CONTEXT:\n"
+        f"{context}\n\n"
+        "QUESTION:\n"
+        f"{question}\n\n"
+        "INSTRUCTIONS:\n"
+        "- فقط از CONTEXT استفاده کن.\n"
+        "- اگر عدد/رتبه/سال داخل CONTEXT هست، دقیق استخراج کن.\n"
+    )
+    res = await answer_agent.run(prompt)
+    return res.output
+
+
+# -------------------------
+# Full pipeline (parallel FTS + VEC) -> merge -> rerank -> context -> answer
+# -------------------------
+async def run_pipeline(deps: Deps, user_query: str) -> Tuple[str, Dict[str, Any], str]:
+    debug: Dict[str, Any] = {}
+
+    candidates = rewrite_queries(user_query)
+    debug["query_rewrite"] = {"candidates": candidates}
+
+    print("\n================ PIPELINE DEBUG ================")
+    print("Query rewrite candidates:")
+    for i, c in enumerate(candidates, start=1):
+        print(f"  {i}) {c}")
+
+    # We use the first candidate as main retrieval query (you can swap to best later)
+    q = candidates[0]
+
+    print("\n⏳ Parallel tools: FTS + Vector (asyncio.gather)")
+    t0 = time.time()
+    fts_task = call_fulltext(deps, q, config.FTS_MATCH_COUNT, debug)
+    vec_task = call_vector(deps, q, config.VEC_MATCH_COUNT, debug)
+
+    print("FTS RPC =", config.FTS_RPC)
+    # print("FTS query_text =", query_text)
+
+
+    fts_res, vec_res = await asyncio.gather(fts_task, vec_task, return_exceptions=True)
+    debug["parallel_search_time_sec"] = round(time.time() - t0, 3)
+
+    if isinstance(fts_res, Exception):
+        debug["fts_error"] = str(fts_res)
+        fts_items = []
+        print(f"⚠️ FTS failed: {fts_res}")
+    else:
+        fts_items = fts_res
+
+    if isinstance(vec_res, Exception):
+        debug["vec_error"] = str(vec_res)
+        vec_items = []
+        print(f"⚠️ Vector failed: {vec_res}")
+    else:
+        vec_items = vec_res
+
+    print("\nCounts:")
+    print(f"  FTS raw={debug.get('fts', {}).get('raw_count', 0)} normalized={debug.get('fts', {}).get('normalized_count', 0)}")
+    print(f"  VEC raw={debug.get('vector', {}).get('raw_count', 0)} normalized={debug.get('vector', {}).get('normalized_count', 0)}")
+
+    if not fts_items and not vec_items:
+        debug["status"] = "no_results"
+        return ("متأسفانه محتوای مرتبطی یافت نشد.", debug, "")
+
+    print("\n🧠 Reranker stage (after merge/union)...")
+    ranked = await merge_and_rerank(deps, q, fts_items, vec_items, debug)
+
+    print(f"  Union unique={debug.get('union', {}).get('unique_count', 0)}")
+    if debug.get("rerank", {}).get("enabled"):
+        print(f"  Rerank top scores: {debug['rerank']['top_scores'][: min(8, len(debug['rerank']['top_scores']))]}")
+    else:
+        print("  Rerank disabled (FlagEmbedding/torch not available).")
+
+    print("\n✅ Final accepted chunks (before neighbor fetch):")
+    for i, it in enumerate(ranked[: config.FINAL_TOP], start=1):
+        print(f"  {i}) {short_meta(it)}")
+
+    context = await build_context(deps, ranked, debug)
+
+    # Save debug artifacts
+    try:
+        with open("debug_context.txt", "w", encoding="utf-8") as f:
+            f.write(context)
+    except Exception:
+        pass
+
+    if config.DEBUG_SAVE_JSON:
+        try:
+            with open("debug_pipeline.json", "w", encoding="utf-8") as f:
+                json.dump(debug, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    print("\nSaved: debug_context.txt and debug_pipeline.json")
+    print("================================================\n")
+
+    final_answer = await answer_with_context(user_query, context)
+    return (final_answer, debug, context)
+
+
+# -------------------------
+# Main
+# -------------------------
+async def main() -> None:
+    if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_KEY:
+        raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_KEY not set")
+    if not config.GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not set")
+
+    deps = Deps(
+        supabase=create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY),
+        cloudflare=CloudflareEmbedClient(),
+        reranker=RerankerClient(),
+    )
+
+    print("✅ Ready. type 'exit' to quit.")
+
+    try:
+        while True:
+            user_q = input("\n👤 سوال: ").strip()
+            if not user_q or user_q.lower() in ("exit", "quit"):
+                break
+
+            try:
+                answer, _debug, _ctx = await run_pipeline(deps, user_q)
+                print("\n🤖 پاسخ:\n")
+                print(answer)
+            except Exception as e:
+                print(f"\n❌ خطا: {e}")
+    finally:
+        try:
+            await deps.cloudflare.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
